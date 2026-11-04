@@ -2,13 +2,13 @@ local DataStoreService = game:GetService("DataStoreService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PointsStore = DataStoreService:GetDataStore("PlayerPoints")
 local Players = game:GetService("Players")
-local Teams = game:GetService("Teams")
 local XP = require(game.ServerScriptService.Core.XPSys.Settings)
 
 local xpEvents = ReplicatedStorage.XPEvents
 local zoneEvent = xpEvents.ZoneStatusEvent
 
 local playerXPData = {}
+local loadFailed = {}
 
 local function errorFunc(errMsg)
 	warn("[XP SYSTEM ERROR]:", errMsg)
@@ -63,7 +63,9 @@ local function loadData(player)
 	end)
 
 	if not success then
-		errorFunc("Failed to load data for " .. player.Name .. ": " .. data)
+		errorFunc("Failed to load data for " .. player.Name .. ": " .. tostring(data))
+		loadFailed[player] = true
+		data = nil
 	end
 
 	playerXPData[player] = data or {}
@@ -77,6 +79,8 @@ local function loadData(player)
 end
 
 local function saveData(player)
+	if loadFailed[player] then return end
+
 	local playerKey = "Player_" .. player.UserId
 	local data = playerXPData[player]
 	if not data then return end
@@ -86,9 +90,7 @@ local function saveData(player)
 	end)
 
 	if not success then
-		errorFunc("Failed to save data for " .. player.Name .. ": " .. err)
-	else
-		print("[SAVE]: Saved data for", player.Name)
+		errorFunc("Failed to save data for " .. player.Name .. ": " .. tostring(err))
 	end
 end
 
@@ -108,8 +110,6 @@ local function givePoints(player, amount)
 
 	player:SetAttribute("Points", teamData.Points)
 	player:SetAttribute("Rank", getRank(teamData.Points, teamKey))
-
-	print("[GIVE]:", player.Name, "got", amount, "in", team.Name, "Total:", teamData.Points)
 end
 
 local function applyPointsAtIntervals()
@@ -118,8 +118,6 @@ local function applyPointsAtIntervals()
 		for _, player in ipairs(Players:GetPlayers()) do
 			if isValidTeam(player) then
 				givePoints(player, XP.points)
-			else
-				errorFunc(player.Name .. " is not in a valid team to receive points.")
 			end
 		end
 	end
@@ -164,6 +162,11 @@ local function onZoneTouched(zonePart)
 		local player = Players:GetPlayerFromCharacter(character)
 		if not player or not playersInZone[player] then return end
 
+		local overlapParams = OverlapParams.new()
+		overlapParams.FilterType = Enum.RaycastFilterType.Include
+		overlapParams.FilterDescendantsInstances = { character }
+		if #workspace:GetPartsInPart(zonePart, overlapParams) > 0 then return end
+
 		playersInZone[player] = nil
 		player:SetAttribute("CurrentZone", "")
 		zoneEvent:FireClient(player, false, nil)
@@ -173,7 +176,7 @@ end
 for _, zonePart in ipairs(XPZones:GetChildren()) do
 	if zonePart:IsA("BasePart") then
 		if not zoneRates[zonePart.Name] then
-			warn("[SETUP]: Zone", zonePart.Name, "has no rate defined — defaulting to 1.")
+			warn("[SETUP]: Zone", zonePart.Name, "has no rate defined - defaulting to 1.")
 			zoneRates[zonePart.Name] = 1
 		end
 		onZoneTouched(zonePart)
@@ -194,11 +197,37 @@ Players.PlayerAdded:Connect(function(player)
 			player:SetAttribute("Rank", getRank(teamData.Points, teamKey))
 		end
 	end)
+
+	player.CharacterRemoving:Connect(function()
+		if not playersInZone[player] then return end
+
+		playersInZone[player] = nil
+		player:SetAttribute("CurrentZone", "")
+		zoneEvent:FireClient(player, false, nil)
+	end)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
 	saveData(player)
 	playersInZone[player] = nil
+	playerXPData[player] = nil
+	loadFailed[player] = nil
+end)
+
+game:BindToClose(function()
+	local pending = 0
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		pending += 1
+		task.spawn(function()
+			saveData(player)
+			pending -= 1
+		end)
+	end
+
+	while pending > 0 do
+		task.wait()
+	end
 end)
 
 task.spawn(applyPointsAtIntervals)
