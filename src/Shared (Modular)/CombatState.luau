@@ -1,3 +1,5 @@
+// ts is buns, dont even look im embarrased. Gonna make a new R15 system soon, this was R6.
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
