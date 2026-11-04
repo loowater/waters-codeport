@@ -54,6 +54,7 @@ local JobTools = {
 
 local jobTargets = {}
 local originalClothing = {}
+local paycheckThreads = {}
 
 local function weld(part0: BasePart, part1: BasePart)
 	local joint = Instance.new("Weld")
@@ -72,24 +73,40 @@ local function createValue(className: string, name: string, value: any, parent: 
 	return object
 end
 
+local function isValidAmount(amount: any): boolean
+	return typeof(amount) == "number" and amount > 0 and amount % 1 == 0 and amount < math.huge
+end
+
 local function setupPrompts()
 	for _, instance in workspace:GetDescendants() do
 		if instance:IsA("ProximityPrompt") and instance.Name == "BuyItem" then
+			local name = instance:GetAttribute("Name")
 			local price = instance:GetAttribute("Price")
+			local gamepassRequired = instance:GetAttribute("GamepassRequired")
+
+			if not name or not price then
+				continue
+			end
+
 			local actionText = "Buy (" .. price .. " " .. EconomyConfig.Currency .. ") "
 
-			if instance:GetAttribute("GamepassRequired") ~= 0 then
+			if gamepassRequired and gamepassRequired ~= 0 then
 				actionText ..= "[GAMEPASS]"
 			end
 
-			instance.ObjectText = instance:GetAttribute("Name")
+			instance.ObjectText = name
 			instance.ActionText = actionText
 		end
 	end
 end
 
-local function attachModel(character: Model, template: Model, limb: BasePart)
-	template.PrimaryPart = template:FindFirstChild("Middle")
+local function attachModel(character: Model, template: Model, limb: BasePart?)
+	local middle = template:FindFirstChild("Middle")
+	if not middle or not limb then
+		return
+	end
+
+	template.PrimaryPart = middle
 
 	local model = template:Clone()
 	model.Name = template.Name
@@ -130,7 +147,8 @@ end
 
 local function equipJobGear(character: Model, job: string)
 	if job == "DeliverFood" then
-		attachModel(character, MiscFolder.FoodBackpack, character:FindFirstChild("Torso"))
+		local torso = character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
+		attachModel(character, MiscFolder.FoodBackpack, torso)
 	elseif JobUniforms[job] then
 		giveUniform(character, JobUniforms[job])
 	end
@@ -155,19 +173,31 @@ end
 
 local function endJob(player: Player)
 	local status = player:FindFirstChild("CurrentJob")
+	local character = player.Character
+
+	if not status or not character then
+		return
+	end
 
 	clearJobItems(player.Backpack)
-	clearJobItems(player.Character)
-	removeModel(player.Character, "FoodBackpack")
+	clearJobItems(character)
+	removeModel(character, "FoodBackpack")
 
 	EndJobEvent:FireClient(player)
 	jobTargets[player] = {}
 	status.Value = "None"
 
-	local shirt = player.Character:FindFirstChildOfClass("Shirt")
-	local pants = player.Character:FindFirstChildOfClass("Pants")
-	shirt.ShirtTemplate = originalClothing[player.Name].ShirtID
-	pants.PantsTemplate = originalClothing[player.Name].PantsID
+	local saved = originalClothing[player.Name]
+	local shirt = character:FindFirstChildOfClass("Shirt")
+	local pants = character:FindFirstChildOfClass("Pants")
+
+	if saved and shirt then
+		shirt.ShirtTemplate = saved.ShirtID
+	end
+
+	if saved and pants then
+		pants.PantsTemplate = saved.PantsID
+	end
 end
 
 local function getPromptPosition(prompt: ProximityPrompt): Vector3
@@ -203,8 +233,12 @@ local function handleDelivery(prompt: ProximityPrompt, player: Player, delivery)
 		return
 	end
 
-	local actionModule = require(ActionModules:FindFirstChild(prompt.Name))
-	if actionModule.Execute(prompt, player) then
+	local actionModule = ActionModules:FindFirstChild(prompt.Name)
+	if not actionModule then
+		return
+	end
+
+	if require(actionModule).Execute(prompt, player) then
 		local targetFolder = GameWorkspace[JobTargetFolders[delivery.Job]]
 		targets[delivery.Job] = math.random(1, #targetFolder:GetChildren())
 	end
@@ -222,16 +256,26 @@ local function handleGetTool(prompt: ProximityPrompt, player: Player)
 	grantTool(player, template, job, prompt:GetAttribute("OnlyOne"))
 end
 
+local function stopPaychecks(player: Player)
+	local thread = paycheckThreads[player]
+	if thread and coroutine.status(thread) ~= "dead" then
+		task.cancel(thread)
+	end
+	paycheckThreads[player] = nil
+end
+
 local function startPaychecks(player: Player, wallet: IntValue, bank: IntValue)
+	stopPaychecks(player)
+
 	for teamName, paycheck in EconomyConfig.PaycheckList do
-		if player.Team.Name ~= teamName then
+		if not player.Team or player.Team.Name ~= teamName then
 			continue
 		end
 
 		local amount, minutes, toWallet = table.unpack(paycheck)
 
-		task.spawn(function()
-			while player.Team.Name == teamName do
+		paycheckThreads[player] = task.spawn(function()
+			while player.Parent and player.Team and player.Team.Name == teamName do
 				task.wait(minutes * 60)
 
 				if toWallet == false then
@@ -270,8 +314,8 @@ local function onCharacterLoaded(player: Player, character: Model, jobStatus: St
 	local defaults = ClothingFolder.Default
 
 	originalClothing[player.Name] = {
-		ShirtID = shirt.ShirtTemplate or defaults.Shirt.ShirtTemplate,
-		PantsID = pants.PantsTemplate or defaults.Pants.PantsTemplate,
+		ShirtID = if shirt and shirt.ShirtTemplate ~= "" then shirt.ShirtTemplate else defaults.Shirt.ShirtTemplate,
+		PantsID = if pants and pants.PantsTemplate ~= "" then pants.PantsTemplate else defaults.Pants.PantsTemplate,
 	}
 
 	equipJobGear(character, jobStatus.Value)
@@ -285,8 +329,32 @@ local function onCharacterLoaded(player: Player, character: Model, jobStatus: St
 	end
 end
 
+local function savePlayer(player: Player)
+	local data = player:FindFirstChild("PlayerData")
+	if not data then
+		return
+	end
+
+	local success, err = pcall(function()
+		PlayerDatastore:SetAsync(player.UserId, { data.Wallet.Value, data.Bank.Value })
+	end)
+
+	if not success then
+		warn("[Economy] Failed to save data for " .. player.Name .. ": " .. tostring(err))
+	end
+end
+
 local function onPlayerAdded(player: Player)
-	local savedData = PlayerDatastore:GetAsync(player.UserId)
+	local success, savedData = pcall(function()
+		return PlayerDatastore:GetAsync(player.UserId)
+	end)
+
+	if not success then
+		warn("[Economy] Failed to load data for " .. player.Name .. ": " .. tostring(savedData))
+		player:Kick("Your data failed to load. Please rejoin.")
+		return
+	end
+
 	local walletAmount, bankAmount = table.unpack(savedData or EconomyConfig.StartingMoney)
 
 	local jobStatus = createValue("StringValue", "CurrentJob", "None", player)
@@ -305,12 +373,20 @@ local function onPlayerAdded(player: Player)
 end
 
 local function onPlayerRemoving(player: Player)
-	local data = player:FindFirstChild("PlayerData")
-	PlayerDatastore:SetAsync(player.UserId, { data.Wallet.Value, data.Bank.Value })
+	stopPaychecks(player)
+	savePlayer(player)
+	jobTargets[player] = nil
+	originalClothing[player.Name] = nil
 end
 
 local function onPromptTriggered(prompt: ProximityPrompt, player: Player)
-	local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+	local character = player.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not rootPart or not prompt.Parent then
+		return
+	end
+
 	local distance = (getPromptPosition(prompt) - rootPart.Position).Magnitude
 
 	if distance > prompt.MaxActivationDistance then
@@ -333,6 +409,11 @@ end
 
 local function onBankRequest(player: Player, deposit: boolean, amount: number)
 	local data = player:FindFirstChild("PlayerData")
+
+	if not data or typeof(deposit) ~= "boolean" or not isValidAmount(amount) then
+		return
+	end
+
 	local source, destination = data.Bank, data.Wallet
 
 	if deposit then
@@ -346,7 +427,7 @@ local function onBankRequest(player: Player, deposit: boolean, amount: number)
 end
 
 local function onTransferRequest(player: Player, targetName: string, amount: number)
-	if not amount or amount <= 0 then
+	if typeof(targetName) ~= "string" or not isValidAmount(amount) then
 		return
 	end
 
@@ -359,8 +440,15 @@ local function onTransferRequest(player: Player, targetName: string, amount: num
 		return
 	end
 
-	local senderBank = player:FindFirstChild("PlayerData").Bank
-	local targetBank = target:FindFirstChild("PlayerData").Bank
+	local senderData = player:FindFirstChild("PlayerData")
+	local targetData = target:FindFirstChild("PlayerData")
+
+	if not senderData or not targetData then
+		return
+	end
+
+	local senderBank = senderData.Bank
+	local targetBank = targetData.Bank
 
 	if senderBank.Value < amount then
 		return
@@ -387,7 +475,7 @@ end
 local function onStartJob(player: Player, job: string)
 	local currentJob = player:FindFirstChild("CurrentJob")
 
-	if currentJob.Value ~= "None" or not table.find(JOBS, job) then
+	if not currentJob or not player.Character or currentJob.Value ~= "None" or not table.find(JOBS, job) then
 		return
 	end
 
@@ -396,15 +484,24 @@ local function onStartJob(player: Player, job: string)
 end
 
 local function watchGarbageBag(bag: BasePart)
+	local respawning = false
+
 	bag.Changed:Connect(function(property)
-		if property ~= "Transparency" then
+		if property ~= "Transparency" or bag.Transparency == 0 or respawning then
 			return
 		end
 
+		respawning = true
+
 		task.delay(GARBAGE_RESPAWN_TIME, function()
+			respawning = false
 			bag.Transparency = 0
-			bag:FindFirstChildOfClass("ProximityPrompt").Enabled = true
 			bag.CanCollide = false
+
+			local prompt = bag:FindFirstChildOfClass("ProximityPrompt")
+			if prompt then
+				prompt.Enabled = true
+			end
 		end)
 	end)
 end
@@ -424,3 +521,19 @@ TransferEvent.OnServerEvent:Connect(onTransferRequest)
 CheckUIEvent.OnServerEvent:Connect(onCheckUI)
 StartJobEvent.OnServerEvent:Connect(onStartJob)
 EndJobEvent.OnServerEvent:Connect(endJob)
+
+game:BindToClose(function()
+	local pending = 0
+
+	for _, player in Players:GetPlayers() do
+		pending += 1
+		task.spawn(function()
+			savePlayer(player)
+			pending -= 1
+		end)
+	end
+
+	while pending > 0 do
+		task.wait()
+	end
+end)
